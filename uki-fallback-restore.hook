@@ -1,0 +1,12 @@
+# After a kernel update: puts back the kernel modules the UKIs on the ESP still need,
+# removes the ones no UKI needs anymore. See /usr/bin/uki-fallback.
+[Trigger]
+Type = Path
+Operation = Upgrade
+Operation = Remove
+Target = usr/lib/modules/*/vmlinuz
+
+[Action]
+Description = Restoring the kernel modules of the boot UKIs...
+When = PostTransaction
+Exec = /usr/bin/uki-fallback restore-modules

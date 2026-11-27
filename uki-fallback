@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+# UKI fallback for systemd-boot: every new unified kernel image gets 3 boot tries, then
+# the previous one boots, with the kernel modules it needs. Runs as root (restarts itself
+# with sudo). mkinitcpio builds the UKIs into the staging folder (default_uki in the
+# presets), this script puts them on the ESP.
+#
+# uki-fallback setup
+#     Uses existing UKIs (never creates one): boot menu hidden (timeout 0), panic=10 in
+#     /etc/kernel/cmdline, presets build into the staging folder, then rebuilds. Safe to
+#     run again; prints why if the system does not fit and exits with 0.
+# uki-fallback teardown
+#     Undoes setup (except timeout 0 and panic=10): presets build to the ESP again, one
+#     UKI per kernel without counter, prev UKIs and kept module folders removed, rebuild.
+#     Runs before the package is removed.
+# uki-fallback rollback [name]
+#     From the next boot on, the prev UKI boots: marks the current one bad (<name>+0.efi).
+#     The next rebuild drops it and the new UKI gets 3 tries again. name: only needed
+#     with more than one kernel (e.g. arch-linux-lts).
+# uki-fallback undo [name]
+#     Gives a bad UKI (rolled back or 3 failed boots) 3 new tries.
+#
+# uki-fallback <kernel> <image> <uki>
+#     mkinitcpio post hook (/usr/lib/initcpio/post/uki-fallback), runs after every build.
+#     Only acts on a UKI built into the staging folder. The current UKI on the ESP
+#     becomes <name>-prev.efi if it booted fine (no boot counter in its name); one that
+#     never booted fine is dropped and the old prev stays. Also dropped while running
+#     from the prev (booted once, fallback, rollback), so a rebuild keeps the prev.
+#     The new UKI gets 3 tries (<name>+3.efi): systemd-boot counts them down on every
+#     boot, systemd-bless-boot removes the counter after a successful boot, at 0
+#     systemd-boot boots the prev.
+# uki-fallback save-modules
+#     pacman hook before kernel updates: keeps the module folders of the kernels the UKIs
+#     on the ESP were built for (hard links, no extra space while the originals exist).
+# uki-fallback restore-modules
+#     pacman hook after them: puts back the module folders pacman deleted that a UKI
+#     still needs, so the prev UKI keeps Wi-Fi, sound, ...; removes the ones no UKI needs.
+#
+# The UKI_FALLBACK_* variables below only exist for test.sh.
+set -euo pipefail
+
+if [[ $EUID -ne 0 && -z ${UKI_FALLBACK_TEST:-} ]]; then
+    exec sudo "$0" "$@"
+fi
+
+staging="${UKI_FALLBACK_STAGING:-/var/lib/uki-fallback}"
+modules="${UKI_FALLBACK_MODULES:-/usr/lib/modules}"
+backup="${UKI_FALLBACK_BACKUP:-/usr/lib/modules-uki}"
+presets="${UKI_FALLBACK_PRESETS:-/etc/mkinitcpio.d}"
+cmdline="${UKI_FALLBACK_CMDLINE:-/etc/kernel/cmdline}"
+# Entry systemd-boot started this boot
+selected="${UKI_FALLBACK_EFIVAR:-/sys/firmware/efi/efivars/LoaderEntrySelected-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f}"
+# Marks a module folder put back by this script, so only those get removed again
+marker=.uki-fallback
+
+esp="${UKI_FALLBACK_ESP:-$(bootctl --print-esp-path 2>/dev/null || true)}"
+linux="$esp/EFI/Linux"
+
+# Kernel version a UKI was built for (its .uname section)
+kernel_version() {
+    local tmp
+    tmp="$(mktemp)"
+    objcopy --dump-section .uname="$tmp" "$1" /dev/null 2>/dev/null || true
+    cat "$tmp"
+    rm -f "$tmp"
+}
+
+# Kernel versions of all UKIs on the ESP
+needed_versions() {
+    local uki
+    for uki in "$linux"/*.efi; do
+        if [[ -e $uki ]]; then
+            kernel_version "$uki"
+            echo
+        fi
+    done | sort -u | sed '/^$/d'
+}
+
+# Entry id of this boot, e.g. arch-linux-prev.efi (4 bytes attributes, then UTF-16)
+booted_entry() {
+    if [[ -r $selected ]]; then
+        tail -c +5 "$selected" | iconv -f UTF-16LE -t UTF-8 | tr -d '\0'
+    fi
+}
+
+# default_uki of a preset file
+preset_uki() {
+    bash -c '. "$1"; printf %s "${default_uki:-}"' _ "$1"
+}
+
+# Sets default_uki of a preset file
+set_preset_uki() {
+    sed -i "s|^default_uki=.*|default_uki=\"$2\"|" "$1"
+}
+
+# UKI name for rollback/undo: the given one, else the only one built into the staging folder
+uki_name() {
+    if [[ -n $1 ]]; then
+        echo "$1"
+        return
+    fi
+    local preset uki names=()
+    for preset in "$presets"/*.preset; do
+        [[ -e $preset ]] || continue
+        uki="$(preset_uki "$preset")"
+        if [[ $uki == "$staging"/*.efi ]]; then
+            names+=("$(basename "$uki" .efi)")
+        fi
+    done
+    if [[ ${#names[@]} -ne 1 ]]; then
+        echo "Give the UKI name, one of: ${names[*]:-none found}" >&2
+        exit 1
+    fi
+    echo "${names[0]}"
+}
+
+# Current UKI of a name: <name>.efi (booted fine) or <name>+N[-M].efi (counting or bad)
+current_uki() {
+    local f
+    for f in "$linux/$1.efi" "$linux/$1"+*.efi; do
+        if [[ -e $f ]]; then
+            echo "$f"
+            return
+        fi
+    done
+}
+
+is_bad() {
+    [[ $1 =~ \+0(-[0-9]+)?\.efi$ ]]
+}
+
+need_esp() {
+    if [[ -z $esp ]]; then
+        echo "No ESP found (bootctl --print-esp-path)." >&2
+        exit 1
+    fi
+}
+
+case "${1:-}" in
+    "")
+        echo "Usage: uki-fallback setup|teardown|rollback|undo [name]" >&2
+        exit 1
+        ;;
+
+    setup)
+        skip() {
+            echo "uki-fallback: not set up – $1"
+            exit 0
+        }
+        bootctl is-installed &>/dev/null || skip "systemd-boot is not installed"
+        [[ -n $esp ]] || skip "no ESP found"
+        [[ -f $cmdline ]] || skip "$cmdline is missing"
+
+        # Presets with a UKI on the ESP (to set up) or in the staging folder (done)
+        todo=()
+        ready=0
+        need=0
+        for preset in "$presets"/*.preset; do
+            [[ -e $preset ]] || continue
+            uki="$(preset_uki "$preset")"
+            if [[ $uki == "$staging"/* ]]; then
+                ready=1
+            elif [[ $uki == "$linux"/*.efi && -f $uki ]]; then
+                todo+=("$preset")
+                need=$((need + $(stat -c %s "$uki")))
+            fi
+        done
+        [[ ${#todo[@]} -gt 0 || $ready -eq 1 ]] || skip "no UKI on the ESP found (default_uki in $presets)"
+
+        # Room for a second UKI per kernel, with some margin for bigger kernels
+        free=$(($(df -k --output=avail "$esp" | tail -n 1) * 1024))
+        ((free > need * 12 / 10)) || skip "not enough free space on the ESP ($esp)"
+
+        rebuild=0
+
+        # No menu; Space during boot still shows it
+        conf="$esp/loader/loader.conf"
+        if ! grep -qE '^timeout[[:space:]]+0[[:space:]]*$' "$conf" 2>/dev/null; then
+            if grep -qE '^timeout' "$conf" 2>/dev/null; then
+                sed -i -E 's/^timeout.*/timeout 0/' "$conf"
+            else
+                mkdir -p "$(dirname "$conf")"
+                echo "timeout 0" >>"$conf"
+            fi
+        fi
+
+        # Reboot 10s after a kernel panic, so it counts as a failed try
+        if ! grep -qE '(^|[[:space:]])panic=' "$cmdline"; then
+            echo "panic=10" >>"$cmdline"
+            rebuild=1
+        fi
+
+        # mkinitcpio builds into the staging folder, the post hook moves the UKI to the ESP
+        install -dm700 "$staging"
+        for preset in "${todo[@]}"; do
+            set_preset_uki "$preset" "$staging/$(basename "$(preset_uki "$preset")")"
+            rebuild=1
+        done
+
+        # The current UKI becomes the prev, the new one gets 3 tries
+        if [[ $rebuild -eq 1 ]]; then
+            mkinitcpio -P
+        fi
+
+        echo "uki-fallback: set up – no boot menu (hold Space for it), 3 tries per new UKI, then the previous one boots; panic=10"
+        ;;
+
+    teardown)
+        need_esp
+        rebuild=0
+        for preset in "$presets"/*.preset; do
+            [[ -e $preset ]] || continue
+            uki="$(preset_uki "$preset")"
+            [[ $uki == "$staging"/*.efi ]] || continue
+            name="$(basename "$uki" .efi)"
+            prev="$linux/$name-prev.efi"
+            current="$(current_uki "$name")"
+            # Keep one bootable UKI as <name>.efi (in case the rebuild fails):
+            # the current one, the prev if it is bad or missing
+            if [[ -e $prev ]] && { [[ -z $current ]] || is_bad "$current"; }; then
+                rm -f "$linux/$name"+*.efi
+                mv "$prev" "$linux/$name.efi"
+            elif [[ -n $current ]]; then
+                [[ $current == "$linux/$name.efi" ]] || mv "$current" "$linux/$name.efi"
+                rm -f "$prev"
+            fi
+            set_preset_uki "$preset" "$linux/$name.efi"
+            rebuild=1
+        done
+        # Module folders put back for prev UKIs
+        for dir in "$modules"/*/; do
+            if [[ -e $dir$marker ]]; then
+                rm -rf "$dir"
+            fi
+        done
+        rm -rf "$backup" "$staging"
+        if [[ $rebuild -eq 1 ]]; then
+            mkinitcpio -P
+        fi
+        echo "uki-fallback: removed – presets build to the ESP again (timeout 0 and panic=10 stay)"
+        ;;
+
+    rollback)
+        need_esp
+        name="$(uki_name "${2:-}")"
+        prev="$linux/$name-prev.efi"
+        current="$(current_uki "$name")"
+        if [[ ! -e $prev ]]; then
+            echo "No previous UKI ($name-prev.efi), nothing to roll back to." >&2
+            exit 1
+        fi
+        if [[ -z $current ]]; then
+            echo "No current UKI, $name-prev.efi already boots."
+        elif is_bad "$current"; then
+            echo "Already rolled back, $name-prev.efi boots."
+        else
+            mv "$current" "$linux/$name+0.efi"
+            echo "Rolled back: the next boot uses $name-prev.efi ($(kernel_version "$prev")) instead of $(kernel_version "$linux/$name+0.efi")."
+            echo "Undo: uki-fallback undo"
+        fi
+        ;;
+
+    undo)
+        need_esp
+        name="$(uki_name "${2:-}")"
+        current="$(current_uki "$name")"
+        if [[ -n $current ]] && is_bad "$current"; then
+            mv "$current" "$linux/$name+3.efi"
+            echo "Undone: the next boot tries $name+3.efi ($(kernel_version "$linux/$name+3.efi")) again, 3 tries."
+        else
+            echo "Nothing to undo, no bad $name UKI."
+        fi
+        ;;
+
+    save-modules)
+        need_esp
+        for v in $(needed_versions); do
+            if [[ -e $modules/$v/vmlinuz && ! -e $backup/$v ]]; then
+                mkdir -p "$backup"
+                cp -al "$modules/$v" "$backup/$v"
+            fi
+        done
+        ;;
+
+    restore-modules)
+        need_esp
+        needed="$(needed_versions)"
+        for v in $needed; do
+            # Deleted by pacman (leftovers of other packages may remain): put it back
+            if [[ ! -e $modules/$v/vmlinuz && -d $backup/$v ]]; then
+                rm -rf "${modules:?}/$v"
+                mv "$backup/$v" "$modules/$v"
+                touch "$modules/$v/$marker"
+            fi
+        done
+        # Backups are only needed while a transaction runs
+        rm -rf "$backup"
+        # Folders put back earlier that no UKI needs anymore
+        for dir in "$modules"/*/; do
+            v="$(basename "$dir")"
+            if [[ -e $dir$marker ]] && ! grep -qxF "$v" <<<"$needed"; then
+                rm -rf "$dir"
+            fi
+        done
+        ;;
+
+    *)
+        uki="${3:-}"
+        [[ $uki == "$staging"/*.efi ]] || exit 0
+        need_esp
+        name="$(basename "$uki" .efi)"
+        mkdir -p "$linux"
+        # Copy first, so a full ESP leaves the current UKIs untouched
+        cp "$uki" "$linux/.$name.new"
+        # Never booted fine (still counting or bad): drop it, the old prev stays
+        rm -f "$linux/$name"+*.efi
+        # Running from the prev: the current one is not trusted, drop it as well
+        booted="$(booted_entry)"
+        if [[ ${booted,,} == "${name,,}-prev.efi" ]]; then
+            rm -f "$linux/$name.efi"
+        fi
+        # Booted fine: it is the new prev
+        if [[ -e $linux/$name.efi ]]; then
+            mv -f "$linux/$name.efi" "$linux/$name-prev.efi"
+        fi
+        mv "$linux/.$name.new" "$linux/$name+3.efi"
+        rm -f "$uki"
+        ;;
+esac

@@ -1,0 +1,12 @@
+# Before a kernel update: keeps the kernel modules the UKIs on the ESP need.
+# See /usr/bin/uki-fallback.
+[Trigger]
+Type = Path
+Operation = Upgrade
+Operation = Remove
+Target = usr/lib/modules/*/vmlinuz
+
+[Action]
+Description = Keeping the kernel modules of the boot UKIs...
+When = PreTransaction
+Exec = /usr/bin/uki-fallback save-modules

@@ -1,0 +1,8 @@
+post_install() {
+    echo "To use it: uki-fallback setup"
+}
+
+# Without the tool, the presets would keep building into the staging folder
+pre_remove() {
+    uki-fallback teardown
+}
